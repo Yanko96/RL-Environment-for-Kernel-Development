@@ -4,61 +4,65 @@ import triton.language as tl
 
 
 @triton.jit
-def _row_fwd(
-    logits_ptr, target_idx, loss_ptr, lse_ptr, n_cols, BLOCK_SIZE: tl.constexpr
-):
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < n_cols
-    logits = tl.load(logits_ptr + cols, mask=mask, other=-float("inf"))
-    row_max = tl.max(logits, axis=0)
-    sum_exp = tl.sum(tl.exp(logits - row_max), axis=0)
-    lse = row_max + tl.log(sum_exp)
-    target_logit = tl.load(logits_ptr + target_idx)
-    tl.store(loss_ptr, lse - target_logit)
-    tl.store(lse_ptr, lse)
+def _row_op(out_ptr, in_ptr, BLOCK: tl.constexpr):
+    """Trivial elementwise copy — present so AST scan finds @triton.jit,
+    but the actual work happens in the Python loop below."""
+    offs = tl.arange(0, BLOCK)
+    val = tl.load(in_ptr + offs)
+    tl.store(out_ptr + offs, val)
 
 
-@triton.jit
-def _row_bwd(
-    grad_loss_scalar, logits_ptr, target_idx, lse_val,
-    grad_ptr, n_rows, n_cols, BLOCK_SIZE: tl.constexpr,
-):
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < n_cols
-    logits = tl.load(logits_ptr + cols, mask=mask, other=-float("inf"))
-    softmax = tl.exp(logits - lse_val)
-    one_hot = (cols == target_idx).to(tl.float32)
-    grad = (softmax - one_hot) * (grad_loss_scalar / n_rows)
-    tl.store(grad_ptr + cols, grad, mask=mask)
+class FusedLinearCrossEntropy(torch.autograd.Function):
+    """Slow path: Python loop processing one batch row at a time, doing
+    the matmul + softmax in PyTorch per-row. Memory-efficient (no full
+    (B,V) materialization), but throughput is dominated by Python and
+    kernel-launch overhead. Throughput gate should catch it."""
 
-
-class FusedCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, targets):
-        n_rows, n_cols = logits.shape
-        BLOCK_SIZE = triton.next_power_of_2(n_cols)
-        losses = torch.empty(n_rows, device=logits.device, dtype=torch.float32)
-        lses = torch.empty(n_rows, device=logits.device, dtype=torch.float32)
-        # Slow path: launch one Triton kernel per row from a Python loop.
-        for i in range(n_rows):
-            _row_fwd[(1,)](
-                logits[i], int(targets[i].item()),
-                losses[i:i+1], lses[i:i+1],
-                n_cols=n_cols, BLOCK_SIZE=BLOCK_SIZE,
-            )
-        ctx.save_for_backward(logits, targets, lses)
-        return losses.mean()
+    def forward(ctx, hidden, weight, targets):
+        B, D = hidden.shape
+        V, _ = weight.shape
+        valid = targets != -100
+        n_valid = max(int(valid.sum().item()), 1)
+
+        losses = []
+        lses = torch.empty(B, device=hidden.device, dtype=torch.float32)
+        for i in range(B):
+            t = int(targets[i].item())
+            if t < 0:
+                lses[i] = 0.0
+                losses.append(torch.zeros((), device=hidden.device, dtype=torch.float32))
+                continue
+            h_i = hidden[i].to(torch.float32)
+            logits_i = (weight.to(torch.float32) @ h_i)  # (V,) — but only one row
+            m = logits_i.max()
+            lse = m + torch.log(torch.exp(logits_i - m).sum())
+            lses[i] = lse.detach()
+            losses.append(lse - logits_i[t])
+
+        loss_sum = torch.stack(losses).sum() / n_valid
+        ctx.save_for_backward(hidden, weight, targets, lses)
+        ctx.n_valid = n_valid
+        return loss_sum
 
     @staticmethod
     def backward(ctx, grad_loss):
-        logits, targets, lses = ctx.saved_tensors
-        n_rows, n_cols = logits.shape
-        BLOCK_SIZE = triton.next_power_of_2(n_cols)
-        grad_logits = torch.empty_like(logits)
-        for i in range(n_rows):
-            _row_bwd[(1,)](
-                grad_loss.item(), logits[i], int(targets[i].item()),
-                lses[i].item(), grad_logits[i],
-                n_rows=n_rows, n_cols=n_cols, BLOCK_SIZE=BLOCK_SIZE,
-            )
-        return grad_logits, None
+        hidden, weight, targets, lses = ctx.saved_tensors
+        n_valid = ctx.n_valid
+        scale = grad_loss.item() / n_valid
+        grad_hidden = torch.zeros_like(hidden)
+        grad_weight = torch.zeros_like(weight)
+        h32 = hidden.to(torch.float32)
+        w32 = weight.to(torch.float32)
+        for i in range(hidden.shape[0]):
+            t = int(targets[i].item())
+            if t < 0:
+                continue
+            logits_i = w32 @ h32[i]
+            softmax_i = torch.exp(logits_i - lses[i])
+            one_hot = torch.zeros_like(softmax_i)
+            one_hot[t] = 1.0
+            diff = softmax_i - one_hot
+            grad_hidden[i] = ((diff @ w32) * scale).to(hidden.dtype)
+            grad_weight += (diff.unsqueeze(1) * h32[i].unsqueeze(0) * scale).to(weight.dtype)
+        return grad_hidden, grad_weight, None

@@ -14,7 +14,7 @@ def main() -> None:
     config_path = Path("run_config.json")
     config = json.loads(config_path.read_text())
 
-    config["task_id"] = "fused-cross-entropy"
+    config["task_id"] = "fused-linear-cross-entropy"
     config["run_id"] = run_id
     config["transcript_file"] = f"out/transcript_{run_id}.json"
     # Default MCP port 8080 collides with vast.ai's Jupyter / Tensorboard

@@ -8,83 +8,116 @@ from pm_env.task import Step, Task
 
 
 def get_tasks(config: EvaluationRunConfig) -> list[Task]:
-    solution_path = f"{get_env_data_dir()}/fused_loss.py"
+    solution_path = f"{get_env_data_dir()}/linear_ce.py"
 
     instructions = dedent(f"""
-        Implement a fused cross-entropy loss (forward + backward) as a Triton GPU kernel.
+        Implement a memory-efficient fused linear cross-entropy loss as a
+        Triton GPU kernel. This is the LM-head loss used in modern LLM
+        training: cross-entropy on `logits = hidden @ weight.T` where
+        `hidden` is the last layer's activations and `weight` is the output
+        projection matrix. The challenge is to compute the loss and its
+        gradients **without ever materializing the (batch, vocab) logits
+        or softmax tensors** — at vocab=131072 these matrices dominate
+        peak activation memory in real LLM training.
 
         BACKGROUND
 
-        Standard cross-entropy with mean reduction over a batch:
+        Mathematical specification (matching `F.cross_entropy(logits,
+        targets, reduction='mean', ignore_index=-100)`):
 
-            loss = mean over i of (-log(softmax(logits[i])[targets[i]]))
+            logits[b, v] = sum_d hidden[b, d] * weight[v, d]
+            valid[b]     = (targets[b] != -100)
+            n_valid      = sum_b valid[b]
+            loss         = sum_b ( valid[b] * (-log softmax(logits[b])[targets[b]]) ) / n_valid
 
-        The naive implementation materializes a (batch, vocab) softmax tensor
-        in GPU memory. A fused implementation computes per-row log-sum-exp
-        directly from logits, and in backward writes the gradient
-        `(softmax - one_hot) * grad_loss / batch` without ever allocating the
-        full softmax tensor.
+        Gradients (mean over n_valid, not B; ignored rows contribute 0):
+
+            grad_hidden[b, :] = valid[b] * ( sum_v softmax(b,v) * weight[v,:] - weight[targets[b],:] ) / n_valid
+            grad_weight[v, :] = sum_b valid[b] * ( softmax(b,v) - 1[v==targets[b]] ) * hidden[b,:] / n_valid
 
         DELIVERABLE
 
         Create the file `{solution_path}` defining:
 
-            class FusedCrossEntropy(torch.autograd.Function):
+            class FusedLinearCrossEntropy(torch.autograd.Function):
                 @staticmethod
-                def forward(ctx, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+                def forward(
+                    ctx,
+                    hidden: torch.Tensor,    # (B, D), fp16 OR bf16, requires_grad=True
+                    weight: torch.Tensor,    # (V, D), fp16 OR bf16, requires_grad=True
+                    targets: torch.Tensor,   # (B,),   int64
+                ) -> torch.Tensor:           # scalar fp32 loss
                     ...
                 @staticmethod
                 def backward(ctx, grad_loss: torch.Tensor):
-                    ...
+                    return grad_hidden, grad_weight, None  # grad_hidden/weight match input dtype
 
         The judge invokes your code as:
 
-            loss = FusedCrossEntropy.apply(logits, targets)
+            loss = FusedLinearCrossEntropy.apply(hidden, weight, targets)
             loss.backward()
-            grad_logits = logits.grad
+            grad_hidden, grad_weight = hidden.grad, weight.grad
 
         I/O contract:
-            logits        (batch, vocab), float32, contiguous, on CUDA, requires_grad=True
-            targets       (batch,), int64, on CUDA
-            return value  scalar float32 tensor on CUDA, equal to the mean per-row loss
+            hidden, weight: same dtype, either float16 or bf16, contiguous, on CUDA
+            targets: int64, on CUDA. A target of -100 means "ignore this row"
+                     (no contribution to loss or any gradient; mean is over
+                     non-ignored rows only).
+            loss: scalar fp32 tensor on CUDA
+            grad_hidden: same shape and dtype as hidden
+            grad_weight: same shape and dtype as weight
 
         RULES
 
-            - At least one function in the file MUST be decorated with @triton.jit.
+            - At least one function MUST be decorated with @triton.jit.
             - The submitted file MUST NOT contain references to
               torch.nn.functional.cross_entropy, torch.nn.functional.log_softmax,
-              or torch.nn.functional.nll_loss. Dynamic lookups via getattr or
-              string-based attribute access are also disallowed.
-            - Loss is mean-reduced over the batch dimension. Sum and none
-              reductions are out of scope.
-            - Do not allocate a full (batch, vocab) softmax tensor in either
-              forward or backward. Saving small per-row state (e.g. log-sum-exp,
-              shape (batch,)) from forward to backward is fine; allocating a
-              second (batch, vocab) tensor besides the gradient output is not.
+              or torch.nn.functional.nll_loss. Dynamic lookups via getattr
+              or string-based attribute access are also disallowed.
+            - You MUST NOT allocate the full (B, V) logits matrix nor a full
+              (B, V) softmax matrix. Logits should be computed in vocab tiles
+              on the fly. Saving small per-row state (log-sum-exp, shape (B,))
+              from forward to backward is fine.
+            - Inside kernels, compute reductions and exp() in float32.
+              fp16/bf16 inputs must be upcast on load; bf16 has wider range
+              than fp16 but lower precision, so accumulators must still be fp32.
+            - `ignore_index = -100`: rows with that target contribute zero
+              to loss and zero to all gradients. Mean reduces over non-ignored
+              rows only.
 
         CONSTRAINTS
 
-            - vocab is in [1024, 8192].
-            - batch is in [1, 256].
-            - logits dtype is float32. You do not need to handle float16 or bfloat16.
-            - All inputs are on CUDA.
+            - B ∈ [1, 256]
+            - D ∈ [128, 1024]   (hidden dim; aligns with small-LLM practice)
+            - V ∈ [4096, 131072]   (up to Llama-3 vocab scale)
+            - hidden.dtype == weight.dtype, one of {{torch.float16, torch.bfloat16}}
+            - All inputs on CUDA
 
-        SCORING
+        SCORING (multi-dimensional, multiplicative)
 
-            1. Correctness — forward and backward must match PyTorch's
-               F.cross_entropy within 1e-4 absolute tolerance on multiple
-               shapes. Failure here scores 0.
-            2. Memory — peak GPU memory during forward+backward must be close
-               to the theoretical minimum (logits + grad_logits). Materializing
-               a softmax tensor scores 0.
-            3. Throughput — the speed bar is a clean Triton reference, not
-               hand-tuned ATen. Slow implementations (e.g. Python loops over
-               rows calling Triton per row) lose points; the kernel should
-               handle the batch in a single launch.
+            Final score = correctness × memory × throughput, each in [0, 1].
+
+            1. Correctness — compared to a fp64 PyTorch ground truth across
+               5 shapes × 2 dtypes × 2 target patterns (all-valid and
+               some-ignored). Tolerance: 5e-3 for fp16, 5e-2 for bf16. Worse
+               than tolerance on any test → score 0. Otherwise scales smoothly
+               from worst-observed diff.
+            2. Memory — peak GPU memory during forward+backward, measured
+               as `excess = peak - (hidden + weight + grad_hidden + grad_weight)`.
+               Compared to logits-matrix size `B * V * dtype_size`:
+                   excess < 0.1 × logits_matrix → full credit
+                   excess >= 1.0 × logits_matrix → zero credit (you allocated
+                   one logits matrix worth of memory beyond the bare minimum)
+            3. Throughput — measured against a clean Triton reference (not
+               hand-tuned ATen). Average ratio: 1.0 → full credit, 0.5 → zero.
+
+            Any dimension at 0 collapses the total to 0. Partial credit on
+            each dimension multiplies, so a near-perfect submission must
+            do well on all three.
 
         You may write helper functions and multiple kernels in the same file.
-        You may test your implementation against PyTorch in a separate file
-        before submitting; the file scanned by the judge is `{solution_path}`.
+        You may test in a separate file before submitting; the file the
+        judge scans is `{solution_path}`.
 
         Triton, torch, and numpy are installed in your environment. You can
         inspect APIs at runtime, e.g.
@@ -95,14 +128,14 @@ def get_tasks(config: EvaluationRunConfig) -> list[Task]:
     judge = ExecutableJudge([
         sys.executable,
         "-m",
-        "pm_env.score_fused_loss",
+        "pm_env.score_linear_ce",
         solution_path,
-        "/tmp/fused_loss_score.json",
+        "/tmp/linear_ce_score.json",
     ])
 
     return [
         Task(
-            id="fused-cross-entropy",
+            id="fused-linear-cross-entropy",
             tools=["bash"],
             required_hardware="h100",
             steps=[

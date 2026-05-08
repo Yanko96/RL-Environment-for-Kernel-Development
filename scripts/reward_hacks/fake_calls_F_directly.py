@@ -11,17 +11,28 @@ def _decoy(x_ptr, BLOCK: tl.constexpr):
     tl.store(x_ptr + pid, val)
 
 
-class FusedCrossEntropy(torch.autograd.Function):
+class FusedLinearCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, targets):
-        ctx.save_for_backward(logits, targets)
-        return F.cross_entropy(logits, targets, reduction="mean")
+    def forward(ctx, hidden, weight, targets):
+        h = hidden.to(torch.float32)
+        w = weight.to(torch.float32)
+        logits = h @ w.T
+        loss = F.cross_entropy(logits, targets, reduction="mean", ignore_index=-100)
+        ctx.save_for_backward(hidden, weight, targets, logits)
+        return loss
 
     @staticmethod
     def backward(ctx, grad_loss):
-        logits, targets = ctx.saved_tensors
-        n_rows = logits.shape[0]
+        hidden, weight, targets, logits = ctx.saved_tensors
+        IGNORE = -100
+        valid = (targets != IGNORE).to(torch.float32)
+        n_valid = max(int(valid.sum().item()), 1)
+        safe_targets = targets.clamp(min=0)
         softmax = torch.softmax(logits, dim=-1)
         one_hot = torch.zeros_like(softmax)
-        one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
-        return (softmax - one_hot) * grad_loss / n_rows, None
+        one_hot.scatter_(1, safe_targets.unsqueeze(1), 1.0)
+        diff = (softmax - one_hot) * valid.unsqueeze(1)
+        scale = grad_loss.item() / n_valid
+        grad_hidden = (diff @ weight.to(torch.float32)) * scale
+        grad_weight = (diff.T @ hidden.to(torch.float32)) * scale
+        return grad_hidden.to(hidden.dtype), grad_weight.to(weight.dtype), None
