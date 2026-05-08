@@ -18,6 +18,9 @@ dependencies = [
     "pymongo>=4.14.1",
     "textual>=6.2.1",
     "anthropic>=0.75.0",
+    "torch ; sys_platform == 'linux'",
+    "triton ; sys_platform == 'linux'",
+    "numpy",
 ]
 
 [project.scripts]
@@ -26,6 +29,18 @@ pm_env = "pm_env.entrypoints:app"
 [build-system]
 requires = ["uv_build>=0.6.5"]
 build-backend = "uv_build"
+
+# Pin torch to the CUDA 12.8 wheel so the image works on any driver
+# 555+ (RTX 4090/5090, L4, A100, H100). The default PyPI wheel ships
+# CUDA 13 runtime, which requires driver 580+. Triton and numpy come
+# from the default PyPI index.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.ruff.lint]
 select = [

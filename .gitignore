@@ -1,5 +1,23 @@
 out
 
+# Personal dev tooling, contains cloud host info, do not commit
+scripts/sync_*.sh
+
+# Archived dev-iteration transcripts (kept locally for reference,
+# not part of the deliverable submission)
+out_archive/
+
+# Ad-hoc transcript-debugging utilities, hardcoded to specific runs
+scripts/extract_agent_file.py
+scripts/extract_scoring.py
+scripts/trace_turns.py
+scripts/sanity_task.py
+
+# Claude Code local state and our private dev notes
+.claude/
+CLAUDE.md
+TODO.md
+
 env_data/**
 !env_data/.gitkeep
 

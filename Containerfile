@@ -31,6 +31,13 @@ RUN \
 RUN uv python install ${PYTHON_VERSION}
 
 # INSTALL EXTRA SYSTEM DEPENDENCIES HERE
+# Triton compiles a small CUDA driver utility module at first kernel
+# launch via the system C compiler. Without gcc the agent's first
+# `triton.jit` call raises RuntimeError("Failed to find C compiler").
+# python3-devel provides Python.h for any cffi/ctypes bindings.
+RUN dnf install -y gcc gcc-c++ python3-devel \
+    && dnf clean all \
+    && rm -rf /tmp/* /var/tmp/*
 
 # Set up a user for the model.
 # Tools use the demote ID to run as the model user, e.g., for executing shell commands.

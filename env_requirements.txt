@@ -1,1 +1,12 @@
-# Add any Python dependencies the model needs for solving tasks
+# Python dependencies installed inside the agent container (Linux + CUDA 12.8).
+#
+# We pin torch to the specific +cu128 local version so uv resolves to
+# the CUDA 12.8 wheel (which ships nvidia-*-cu12 runtime libs) rather
+# than the default PyPI wheel that ships CUDA 13. The cu128 wheel works
+# on driver 555+; the cu13 default needs driver 580+. PEP 440 sorts
+# local versions BELOW non-local, so without explicit "+cu128" in the
+# pin uv will silently prefer the PyPI cu13 build.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+triton
+numpy
