@@ -10,6 +10,7 @@ collapses the total to 0.
 import ast
 import importlib.util
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -286,9 +287,25 @@ def _throughput_score(agent_class) -> tuple[float, dict]:
         torch.cuda.empty_cache()
 
     avg_ratio = sum(r["speed_ratio"] for r in results) / len(results)
-    # Linear ramp: 0 at 0.5x ref, 1.0 at 1.0x ref, capped at 1.0.
-    score = max(0.0, min(1.0, (avg_ratio - 0.5) / 0.5))
+    score = _throughput_score_from_ratio(avg_ratio)
     return score, {"results": results, "avg_speed_ratio": avg_ratio, "score": score}
+
+
+def _throughput_score_from_ratio(avg_ratio: float) -> float:
+    """Log-scale throughput score so different orders-of-magnitude
+    speedups receive different credit.
+
+    - avg_ratio == 1.0  → 0.5  (matches the naive Triton reference)
+    - avg_ratio == 10x  → 1.0  (well-optimized tl.dot kernel)
+    - avg_ratio < 0.1   → 0.0  (clearly slower than the naive reference)
+
+    Formula: 0.5 + log10(ratio) / 2, clipped to [0, 1]. Reference
+    matches anchor at 0.5 by design — agents that match the naive ref
+    receive partial credit but not full credit.
+    """
+    if avg_ratio <= 0:
+        return 0.0
+    return max(0.0, min(1.0, 0.5 + math.log10(avg_ratio) / 2.0))
 
 
 def _write(path: str, score: float, metadata: dict) -> None:

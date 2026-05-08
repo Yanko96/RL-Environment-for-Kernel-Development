@@ -1,21 +1,27 @@
 #!/usr/bin/env bash
-# Run a single agent rollout against the fused-cross-entropy task.
-# Default model is haiku (cheap). Pass model id as $1 to override.
+# Convenience wrapper used during development to drive a single rollout
+# from a host with the project's venv set up. Not the official
+# entrypoint: pm_env's CLI is `pm_env run --config <run_config.json>`,
+# documented in pyproject.toml under [project.scripts]. This script
+# only chains:
+#   1. pm_env create-run-config        (framework default config)
+#   2. scripts/_update_run_config.py   (our task_id / MCP port overrides)
+#   3. pm_env run --no-containerized   (skip docker, see below)
+#
+# We force --no-containerized because the development environments we
+# used (vast.ai, RunPod) are themselves sandbox containers that
+# disallow docker-in-docker. PM's evaluation infrastructure runs the
+# standard containerized path (the framework's default and what the
+# Containerfile + GitHub Actions image is built for). This script is
+# provided so reviewers can reproduce one of our dev rollouts on a
+# bare host, not as a substitute for the production execution path.
 #
 # Usage:
 #   export ANTHROPIC_API_KEY=sk-ant-...
-#   bash scripts/run_rollout.sh                       # haiku
+#   bash scripts/run_rollout.sh                       # haiku (cheap)
 #   bash scripts/run_rollout.sh claude-opus-4-7       # opus
-#
-# If routing through an SSH-reverse-tunnel proxy (because the cloud GPU
-# can't reach api.anthropic.com directly), set HTTPS_PROXY before
-# invoking. NO_PROXY is forced below to exclude local MCP traffic,
-# which would otherwise be misrouted through the proxy.
 
 set -euo pipefail
-
-# Local MCP server traffic must bypass any HTTP(S)_PROXY the user has set.
-export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,0.0.0.0}"
 
 MODEL="${1:-claude-haiku-4-5-20251001}"
 
@@ -25,19 +31,16 @@ if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
     exit 1
 fi
 
-# Generate a fresh run_config.json. This sets a fresh run_id (UUID) and
-# defaults that we then override.
-uv run --no-sync pm_env create-run-config \
+uv run pm_env create-run-config \
     --model "$MODEL" \
     --model-api-key "$ANTHROPIC_API_KEY" \
     > /dev/null
 
-# Override task_id, run_id (timestamp-based for sortability), transcript path.
-uv run --no-sync python scripts/_update_run_config.py "$MODEL"
+uv run python scripts/_update_run_config.py
 
 echo
 echo ">>> Starting rollout. Streaming events to stdout."
 echo ">>> Transcript will be saved to the path printed above."
 echo
 
-uv run --no-sync pm_env run --config run_config.json --no-containerized
+uv run pm_env run --config run_config.json --no-containerized

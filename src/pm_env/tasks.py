@@ -108,8 +108,18 @@ def get_tasks(config: EvaluationRunConfig) -> list[Task]:
                    excess < 0.1 × logits_matrix → full credit
                    excess >= 1.0 × logits_matrix → zero credit (you allocated
                    one logits matrix worth of memory beyond the bare minimum)
-            3. Throughput — measured against a clean Triton reference (not
-               hand-tuned ATen). Average ratio: 1.0 → full credit, 0.5 → zero.
+            3. Throughput — measured against a clean Triton reference
+               implementation (not hand-tuned ATen). The reference uses
+               element-wise multiply + sum for its inner matmul rather
+               than tensor cores, so a competent `tl.dot`-based agent
+               implementation should comfortably exceed it.
+               Score is log-scale around the reference's speed:
+                   ratio  ≤ 0.1x ref  → 0      (clearly slower than naive ref)
+                   ratio  =  1.0x ref → 0.5    (matches the naive reference)
+                   ratio  ≥ 10x ref   → 1.0    (full credit)
+               Concretely:  score = clamp(0.5 + log10(ratio) / 2, 0, 1).
+               This rewards going beyond the naive reference rather than
+               just matching it.
 
             Any dimension at 0 collapses the total to 0. Partial credit on
             each dimension multiplies, so a near-perfect submission must

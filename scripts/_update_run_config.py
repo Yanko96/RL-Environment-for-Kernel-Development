@@ -1,18 +1,17 @@
 import datetime
 import json
-import sys
 from pathlib import Path
 
 
 def main() -> None:
-    model = sys.argv[1]
+    config_path = Path("run_config.json")
+    config = json.loads(config_path.read_text())
+
+    model = config["model"]
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_id = f"{model}_{ts}"
 
     Path("out").mkdir(exist_ok=True)
-
-    config_path = Path("run_config.json")
-    config = json.loads(config_path.read_text())
 
     config["task_id"] = "fused-linear-cross-entropy"
     config["run_id"] = run_id

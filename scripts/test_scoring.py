@@ -43,10 +43,24 @@ def main() -> None:
     print("metadata:")
     print(json.dumps(result["metadata"], indent=2))
 
-    if result["score"] < 0.5:
+    # The reference solution is intentionally a baseline (not a tensor-core
+    # implementation), so its throughput score is now 0.5 by design (matches
+    # itself = midpoint on the log-scale formula). Total = correctness x
+    # memory x throughput should be near 0.5 for the reference, not 1.0.
+    # We assert only that correctness and memory are passing.
+    dim_scores = result["metadata"].get("dimension_scores")
+    if dim_scores:
+        if isinstance(dim_scores, str):
+            import ast as _ast
+            dim_scores = _ast.literal_eval(dim_scores)
+        if dim_scores.get("correctness", 0) < 0.9:
+            raise SystemExit(f"reference correctness too low: {dim_scores}")
+        if dim_scores.get("memory", 0) < 0.9:
+            raise SystemExit(f"reference memory too low: {dim_scores}")
+    elif result["score"] < 0.3:
         raise SystemExit(
-            f"reference scored {result['score']:.4f} (expected ~1.0). "
-            "Either the reference is wrong or scoring is too strict."
+            f"reference scored {result['score']:.4f}, "
+            "expected total ~0.5 (correctness*memory*0.5_throughput) on the new formula."
         )
 
 
