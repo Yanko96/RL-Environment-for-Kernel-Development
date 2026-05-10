@@ -1,7 +1,7 @@
 [project]
 name = "pm_env"
 version = "0.1.0"
-description = "Let an LLM execute tasks in an environment."
+description = "RL evaluation environment for measuring agentic LLMs on a Triton GPU kernel task (fused linear cross-entropy)."
 classifiers = ["Private :: Do not Upload"]
 requires-python = ">=3.12"
 dependencies = [

@@ -5,16 +5,16 @@
 # documented in pyproject.toml under [project.scripts]. This script
 # only chains:
 #   1. pm_env create-run-config        (framework default config)
-#   2. scripts/_update_run_config.py   (our task_id / MCP port overrides)
+#   2. scripts/_update_run_config.py   (task_id / MCP port overrides)
 #   3. pm_env run --no-containerized   (skip docker, see below)
 #
-# We force --no-containerized because the development environments we
-# used (vast.ai, RunPod) are themselves sandbox containers that
-# disallow docker-in-docker. PM's evaluation infrastructure runs the
-# standard containerized path (the framework's default and what the
-# Containerfile + GitHub Actions image is built for). This script is
-# provided so reviewers can reproduce one of our dev rollouts on a
-# bare host, not as a substitute for the production execution path.
+# --no-containerized is forced because the dev environments used here
+# (vast.ai, RunPod) are themselves sandbox containers that disallow
+# docker-in-docker. The standard containerized path (the framework's
+# default and what the Containerfile + GitHub Actions image is built
+# for) is the production execution path; this script is provided so
+# readers can reproduce one of the recorded rollouts on a bare host,
+# not as a substitute.
 #
 # Usage:
 #   export ANTHROPIC_API_KEY=sk-ant-...

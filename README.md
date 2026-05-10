@@ -1,13 +1,20 @@
-# Fused Linear Cross-Entropy, RL environment
+# Fused Linear Cross-Entropy: an RL evaluation environment
 
-Take-home submission for Preference Model. The task asks an agentic LLM
-to implement a memory-efficient fused linear cross-entropy loss
-(forward + backward) as a Triton GPU kernel, the LM-head loss used in
-modern LLM training. The agent must compute the loss and its gradients
-**without ever materializing the (B, V) logits or softmax tensors**, a
-pattern sometimes called "Cut Cross Entropy" (Wijmans et al., 2024).
+An RL-style evaluation environment for measuring agentic LLMs on a
+non-trivial GPU kernel task. The agent is asked to implement a
+memory-efficient fused linear cross-entropy loss (forward + backward)
+as a Triton GPU kernel — the LM-head loss used in modern LLM training —
+computing the loss and its gradients **without ever materializing the
+(B, V) logits or softmax tensors**, a pattern sometimes called "Cut
+Cross Entropy" (Wijmans et al., 2024).
 
-## What this task tests
+The repo is a study of how to design such an environment so it produces
+a useful learning signal: the reference kernel, a multi-dimensional
+judge (correctness / memory / throughput), an adversarial-submission
+test suite verifying each scoring gate, and an iteration log showing
+how the scoring formula evolved across three versions of the task.
+
+## What this environment measures
 
 Three independent silent-failure surfaces, judged on continuous
 multi-dimensional axes:
@@ -158,8 +165,8 @@ memory gate's noise floor.
 
 ### A real case caught by the AST gate
 
-`out/transcript_claude-haiku-4-5-20251001_20260507_150251.json` is a
-phase-1 rollout (see "Dev iteration log" below). haiku produced a
+`out/transcript_claude-haiku-4-5-20251001_20260507_150251.json` is an
+iteration-1 rollout (see "Iteration log" below). haiku produced a
 numerically correct kernel for the predecessor task, but pasted
 `F.cross_entropy` into the file's `if __name__ == '__main__':` block
 for self-testing and ran its own forbidden-name scan that excluded
@@ -169,15 +176,15 @@ agent didn't read the spec" failure the gate is designed for; the
 gate caught it on a real rollout, not just on synthetic adversarial
 submissions.
 
-## Dev iteration log
+## Iteration log
 
-The deliverable converged through three phases. Each phase corresponds
-to one commit on this branch (`git log --oneline`); checking out an
+The task converged through three iterations. Each iteration corresponds
+to one commit on `main` (`git log --oneline`); checking out an
 earlier commit shows the code state that produced its transcripts.
 
-### Phase 1: Plain fused cross-entropy
+### Iteration 1: Plain fused cross-entropy
 
-The original task asked for a fused log-softmax + NLL kernel directly
+The first version asked for a fused log-softmax + NLL kernel directly
 on a `(B, V)` logits tensor passed in by the caller, with no LM-head
 linear projection and no `ignore_index`. Two transcripts:
 
@@ -190,28 +197,38 @@ linear projection and no `ignore_index`. Two transcripts:
   frontier model at full credit in five turns is not a useful RL
   signal.
 
-### Phase 2: Cut Cross Entropy with linear-ramp throughput
+### Iteration 2: Cut Cross Entropy with linear-ramp throughput
 
-We added the LM-head linear projection (`hidden @ weight.T`),
+I added the LM-head linear projection (`hidden @ weight.T`),
 `ignore_index = -100` masking, fp16 and bf16 inputs (with fp32
 accumulators), and split scoring into three independent multiplicative
 dimensions. The throughput dimension was a linear ramp,
 `min(avg_ratio_to_reference, 1.0)`, with full credit at any ratio
-≥ 1.0× ref. Two opus rollouts:
+≥ 1.0× ref. Three opus rollouts:
 
+- `out/transcript_claude-opus-4-7_20260507_165308.json`
+  (67 turns, **total 0.32**, avg 1.76× ref, c=0.32 / m=1.00 / t=1.00).
+  Correctness gate fired: worst-case grad_hidden diff on
+  `B=1, D=128, V=4096, bf16` was 3.6e-2, just inside the 5e-2 bf16
+  tolerance. Same small-batch bf16 corner case that bit iteration-3
+  rollouts (see below).
 - `out/transcript_claude-opus-4-7_20260507_175707.json`
   (70 turns, **total 1.00**, avg **1.40× ref**).
 - `out/transcript_claude-opus-4-7_20260507_185457.json`
   (68 turns, **total 1.00**, avg **9.10× ref**, single shape peaked
   at 35× ref).
 
-Same model, same task, same total score (1.00), but actual speedup
-varied 7×. The linear cap collapsed the entire optimization signal
-once an agent passed the reference. We changed the formula.
+The two `total=1.00` rollouts illustrate the calibration problem:
+same model, same task, same total score, but actual speedup varied
+6.5×. The linear cap collapsed the entire optimization signal once
+an agent passed the reference, so I changed the formula. (The `0.32`
+rollout shows the correctness gate is independent of the throughput
+formula change; that one would have scored ~the same under either
+formula since correctness, not throughput, was the bottleneck.)
 
-### Phase 3: Log-scale throughput
+### Iteration 3: Log-scale throughput
 
-We changed the throughput score to
+I changed the throughput score to
 `clamp(0.5 + log10(avg_ratio) / 2, 0, 1)`: 0.5 at 1× ref, 1.0 at 10×
 ref, 0 at 0.1× ref. The prompt's SCORING section was updated to
 describe the new formula explicitly, including the 10× full-credit
@@ -250,7 +267,7 @@ threshold-aware, not capability-driven. Well-calibrated formulas
 (where the anchor lines up with what the agent should reasonably
 reach) likely matter more than aggressive thresholds.
 
-In the same phase we also moved the memory gate from a plain ratio
+In the same iteration I also moved the memory gate from a plain ratio
 threshold to `(excess - 20 MB) / logits_matrix_size` after observing
 a constant ~17 MB of CUDA/Triton kernel-launch workspace that scales
 with neither shape nor implementation quality. Agents that genuinely
@@ -258,13 +275,14 @@ materialize a (B, V) tensor still trip the gate at any
 production-relevant shape; agents with merely-noisy small-B
 allocations no longer false-positive.
 
-### What the phase-3 rollouts struggle with, concretely
+### What rollouts struggle with, concretely
 
-- **bf16 grad_hidden in small-batch corners.** Across the failing
-  runs, worst-case diff is on `B=1, D=128, V=4096, bf16` where
-  grad_hidden lands just inside fp16 noise but outside our 5e-2 bf16
-  tolerance. Fix: keep the `softmax @ weight` accumulator in fp32
-  throughout, rather than casting back to bf16 between vocab tiles.
+- **bf16 grad_hidden in small-batch corners.** The `B=1, D=128,
+  V=4096, bf16` configuration shows up across both iteration-2 (opus
+  165308) and iteration-3 failing runs. grad_hidden values land just
+  inside fp16 noise but outside our 5e-2 bf16 tolerance. Fix: keep
+  the `softmax @ weight` accumulator in fp32 throughout, rather than
+  casting back to bf16 between vocab tiles.
 - **Optimization stopping criterion.** See above: agents see "≥10× ref
   → full credit" but stop at ~2× because the kernel feels "fast
   enough". A real software-engineering anti-pattern that the
@@ -279,65 +297,126 @@ allocations no longer false-positive.
   there were no ignored rows for the missing filter to matter on)
   but failed on the `some_ignored` test patterns.
 
-### Summary of all 8 transcripts
+### Summary of all 9 transcripts
 
-| Transcript | Phase | Model | Turns | Total | Speed vs ref | c / m / t |
+Iteration-2 totals are computed under the linear-ramp throughput
+formula (any ratio ≥ 1.0 saturates to 1.00); iteration-3 totals are
+under the log-scale formula. So the apparent total drop between
+iterations is mostly the formula change, not actual performance
+regression: the iteration-2 9.10× opus is faster than every
+iteration-3 rollout but receives 1.00 because the cap saturates,
+while every iteration-3 rollout receives 0.59-0.69 throughput because
+log-scale spreads the band.
+
+| Transcript | Iter | Model | Turns | Total | Speed vs ref | c / m / t |
 |---|:---:|---|---:|---:|---:|---|
-| `haiku ..._150251.json` | 1 | haiku-4-5 | 35 | 0.00 | n/a | AST gate fail |
-| `opus ..._151515.json` | 1 | opus-4-7 | 5 | 1.00 | 1.29× | (legacy formula) |
-| `opus ..._175707.json` | 2 | opus-4-7 | 70 | 1.00 | 1.40× | 1.00 / 1.00 / 1.00 |
-| `opus ..._185457.json` | 2 | opus-4-7 | 68 | 1.00 | 9.10× | 1.00 / 1.00 / 1.00 |
-| `sonnet ..._002643.json` | 3 | sonnet-4-6 | 73 | 0.18 | 1.48× | 0.31 / 1.00 / 0.59 |
-| `sonnet ..._010445.json` | 3 | sonnet-4-6 | 128 | 0.68 | 2.29× | 1.00 / 1.00 / 0.68 |
-| `opus ..._015711.json` | 3 | opus-4-7 | 81 | 0.64 | 1.93× | 1.00 / 1.00 / 0.64 |
-| `opus ..._021852.json` | 3 | opus-4-7 | 83 | 0.38 | 2.40× | 0.54 / 1.00 / 0.69 |
+| `haiku ..._150251.json` | i1 | haiku-4-5 | 35 | 0.00 | n/a | AST gate fail |
+| `opus ..._151515.json` | i1 | opus-4-7 | 5 | 1.00 | 1.29× | (legacy formula) |
+| `opus ..._165308.json` | i2 | opus-4-7 | 67 | 0.32 | 1.76× | 0.32 / 1.00 / 1.00 |
+| `opus ..._175707.json` | i2 | opus-4-7 | 70 | 1.00 | 1.40× | 1.00 / 1.00 / 1.00 |
+| `opus ..._185457.json` | i2 | opus-4-7 | 68 | 1.00 | 9.10× | 1.00 / 1.00 / 1.00 |
+| `sonnet ..._002643.json` | i3 | sonnet-4-6 | 73 | 0.18 | 1.48× | 0.31 / 1.00 / 0.59 |
+| `sonnet ..._010445.json` | i3 | sonnet-4-6 | 128 | 0.68 | 2.29× | 1.00 / 1.00 / 0.68 |
+| `opus ..._015711.json` | i3 | opus-4-7 | 81 | 0.64 | 1.93× | 1.00 / 1.00 / 0.64 |
+| `opus ..._021852.json` | i3 | opus-4-7 | 83 | 0.38 | 2.40× | 0.54 / 1.00 / 0.69 |
+
+### A note on what these transcripts are not
+
+None of the nine are production-grade. Even the strongest rollout
+(opus 185457, 9.10× ref) took 68 turns to land there, and a
+competent kernel author would write something faster in fewer
+iterations. We read this as evidence that the task is doing what an
+RL task is supposed to do. The distance between "frontier model
+out-of-the-box behavior" and "engineer-quality kernel" is exactly
+the gradient an RL training loop would close; if every transcript
+ended with a clean tl.dot kernel in 10 turns, the task would be too
+easy to teach anything.
 
 ## Containerized verification
 
-PM's evaluation infrastructure runs `pm_env run --config <config>`
-on a host with podman or docker installed. The framework itself
-calls `<runtime> build --tag pm_env --file Containerfile .` and then
-spawns the agent inside that locally-built image
-(`run_helpers.py:96` and `:147`). Reviewers do not need to pull a
-prebuilt image; the Containerfile in this repo is the source of
-truth for the agent runtime.
+The framework's intended execution path is `pm_env run --config <config>`,
+which builds the image from `Containerfile` and spawns the agent inside
+it. I did not have access to a docker-enabled NVIDIA host during
+development (the dev clouds I used block docker-in-docker), so the full
+orchestration was not exercised end-to-end. I verified the components
+independently:
 
-We did not have direct access to a docker-enabled NVIDIA host during
-development (our dev clouds were themselves sandbox containers that
-block docker-in-docker), so the full single-shot
-`pm_env run --runtime docker` orchestration was not exercised
-end-to-end. Each sub-component was verified independently:
+- **Containerfile builds cleanly**: CI on every push to main
+  (`.github/workflows/build.yml`), including smoke tests for
+  torch/triton/numpy imports and gcc presence.
+- **Built image runs on GPU**: manual `docker run` of the
+  CI-published image on a RunPod RTX 5090; CUDA passthrough works,
+  reference implementation passes against fp64 ground truth.
+- **Framework + task wiring**: local `pm_env run --no-containerized`
+  confirms the agent receives correct instructions, MCP binds, and
+  tool calls execute. All 9 transcripts in `out/` were produced via
+  `--no-containerized` on a vast.ai RTX 5090.
 
-| Sub-component | How verified |
-|---|---|
-| `Containerfile` builds cleanly (cu128 torch + Triton + gcc) | GitHub Actions on every push to main (`.github/workflows/build.yml`) |
-| Built image: `import torch / triton / numpy`, `gcc` present | CI smoke test inside the just-built image |
-| Built image: CUDA passthrough works, the reference implementation runs against fp64 ground truth | Manual `docker run` of the CI-published image on a RunPod RTX 5090 |
-| Framework defaults to containerized mode and assembles the right build command | Local `pm_env run --config run_config.json` shows `Building container image with command: 'podman build --tag pm_env .'` before erroring out at "podman not installed" on an AMD-only host |
-| Framework + our `tasks.py` task registry + `_update_run_config.py` overrides + MCP server + agent loop wire up correctly | Local `pm_env run --config run_config.json --no-containerized` on an AMD-only host: agent receives the full task instructions, MCP binds to 39100 as configured, agent makes its first bash tool calls, `import torch; import triton` succeed in the agent's subprocess (torch 2.11.0+cu128, Triton 3.6.0; CUDA unavailable as expected on AMD) |
-| Agent + judge + transcript flow on a real CUDA GPU | 8 transcripts in `out/`, all produced via `--no-containerized` on vast.ai RTX 5090 |
+The untested piece is the composition: `<runtime> build` followed
+by `<runtime> run` chained in one `pm_env run` invocation. Each
+half is independently verified; the composition should work, but
+flagging.
 
-The piece we could not exercise directly is `<runtime> build` followed
-by the agent-spawn `<runtime> run` chained inside one `pm_env run`
-invocation on a docker-enabled NVIDIA host. The build half is
-covered by CI; the run half is covered by manual `docker run` of an
-image built from the same Containerfile. The composition should
-work, but flagging.
+One concrete fix this verification surfaced: the upstream reference
+Containerfile installs no C compiler, but Triton needs one at first
+kernel launch. I added `gcc gcc-c++ python3-devel` to the
+Containerfile.
 
-One concrete fix this verification surfaced: **PM's reference
-Containerfile installs no C compiler**, but Triton compiles a small
-CUDA driver utility module at first kernel launch and fails with
-`RuntimeError: Failed to find C compiler` without one. We added
-`gcc gcc-c++ python3-devel` to the `# INSTALL EXTRA SYSTEM
-DEPENDENCIES HERE` slot. Without this fix, every agent submission
-would fail at the first `triton.jit` invocation regardless of its
-algorithmic quality.
+## Known limitations and trade-offs
 
-The CI workflow also pushes the built image to this repository's
-GHCR namespace (`ghcr.io/<owner>/<repo>:latest`, auto-derived from
-`${{ github.repository }}`) purely as a CI artifact so build
-breakage is caught before submission. PM's evaluation does not pull
-from GHCR.
+1. **Memory dimension functions as a hard gate, not a smooth signal
+   among competent agents.** All iteration-3 rollouts scored 1.00 on
+   memory; the prompt framing ("never materialize logits") is
+   explicit enough that frontier models do not trip it. The memory
+   gate's value is catching attack vectors
+   (`scripts/reward_hacks/fake_materialize_softmax.py` confirms this)
+   rather than differentiating competent submissions. A future
+   redesign could push toward a continuous peak-memory ratio more
+   aggressively, at the cost of false-positives on Triton workspace
+   noise.
+
+2. **Multiplicative scoring composition loses partial-credit signal
+   at extreme failures.** `total = correctness × memory × throughput`
+   means any dimension at 0 zeroes the total. This is intentional:
+   it prevents reward hacking by acing one dim (e.g., a memory-clean
+   but incorrect submission, or a fast but incorrect submission,
+   both score 0). The trade-off is that for very-failed submissions
+   we cannot distinguish "almost passed correctness" from
+   "completely wrong": a kernel that misses correctness by 5× the
+   tolerance and one that misses by 100× both end up at 0. Additive
+   composition (or min-min) would preserve that signal but make it
+   easier to hack the easier dimensions.
+
+3. **Throughput "10× full-credit" anchor was calibrated on RTX 5090.**
+   The score formula is ratio-based against the same in-repo Triton
+   reference run on the same hardware, so relative ranking is robust
+   to GPU choice. But the absolute "10× ref" anchor's calibration
+   semantics ("≈ a competent tl.dot kernel") were chosen for the GPU
+   we tested on; on H100 the same agent code may produce different
+   absolute speedups and the anchor may need re-tuning.
+
+4. **One-step task, no multi-turn shaping.** The judge runs once at
+   the end; there is no interactive feedback or partial-credit
+   milestones during the rollout. Two consequences: (a) at inference
+   time, the agent receives no in-rollout signal pulling it past
+   "good enough" (a contributor to the "agents satisfice at 2× ref"
+   finding documented in the dev iteration log); (b) for downstream
+   RL training, the terminal reward means every tool call across a
+   70-130 turn trajectory shares the same gradient credit, which is
+   high-variance and sample-inefficient compared to denser-reward
+   designs.
+
+5. **No turn budget on rollout length.** The framework does not
+   enforce a maximum rollout length and our task prompt does not
+   request one. Across our nine transcripts, length varied from 5
+   turns (iteration-1 opus) to 128 turns (iteration-3 sonnet 010445), a 25×
+   spread. At inference this only translates to API cost variance,
+   but for RL training it adds variance to per-trajectory compute
+   and to the gradient signal (per-tool-call credit assignment is
+   muddier when trajectory length itself is high-variance). A future
+   task spec could surface a soft budget in the prompt ("you have
+   ~N tool calls") or a hard kill at K turns; both trade agent
+   flexibility against training-time predictability.
 
 ## Files
 
@@ -357,7 +436,7 @@ scripts/                    # Dev tooling, runnable from the host with the venv
   analyze_transcript.py     # transcript inspection
   verify_triton.py          # tiny Triton-on-this-GPU sanity check
 
-out/                        # 8 rollout transcripts referenced in dev iteration log
+out/                        # 9 rollout transcripts referenced in dev iteration log
 .github/workflows/build.yml # CI: builds Containerfile, smoke test, pushes to GHCR
 
 Containerfile               # +gcc/g++/python3-devel for Triton runtime compile
@@ -368,8 +447,8 @@ pyproject.toml              # judge-side deps; pytorch-cu128 source via tool.uv.
 ## Hardware requirements
 
 The task requires a single NVIDIA CUDA GPU. The framework's
-`required_hardware` field is set to `"h100"` to match PM's evaluation
-infra, though we did not have direct access to an H100. Any modern
+`required_hardware` field is set to `"h100"`, though I did not have
+direct access to an H100 during development. Any modern
 data-center or Ada-or-newer consumer GPU with ≥24 GB VRAM and a
 CUDA-12.8-compatible driver (≥555) should be sufficient for the
 published shapes (largest test is `B=128, V=131072, fp16`).
@@ -385,7 +464,7 @@ all run on-device.
 
 ## Reproducing
 
-### Containerized (PM's evaluation path)
+### Containerized path
 On a host with podman or docker, an NVIDIA GPU, and a
 CUDA-12.8-compatible driver:
 ```bash
@@ -396,7 +475,7 @@ MODEL=claude-opus-4-7                  # any Claude id; opus produced the best t
 # 1. Framework writes a default run_config.json with the chosen model:
 uv run pm_env create-run-config --model "$MODEL" --model-api-key "$ANTHROPIC_API_KEY" > /dev/null
 
-# 2. Our script overrides task_id, MCP port, and transcript path
+# 2. The helper script overrides task_id, MCP port, and transcript path
 #    (reads the model from run_config.json itself):
 uv run python scripts/_update_run_config.py
 
@@ -413,17 +492,16 @@ the end.
 
 ### Non-containerized (dev wrapper)
 Useful when the host is itself a sandbox container that disallows
-docker-in-docker (vast.ai, RunPod, AutoDL). This is how all eight
+docker-in-docker (vast.ai, RunPod, AutoDL). This is how all nine
 transcripts under `out/` were produced:
 ```bash
 uv sync
 export ANTHROPIC_API_KEY=sk-ant-...
 bash scripts/run_rollout.sh claude-opus-4-7
 ```
-`scripts/run_rollout.sh` is just a wrapper around the same official
-commands plus `--no-containerized` and our `_update_run_config.py`
-overrides. It is not a substitute for the containerized path PM
-uses.
+`scripts/run_rollout.sh` is a wrapper around the same official
+commands plus `--no-containerized` and the `_update_run_config.py`
+overrides. It is not a substitute for the containerized path.
 
 ### Judge standalone (debugging an agent file)
 ```bash
@@ -432,15 +510,3 @@ python -m pm_env.score_linear_ce <agent_file.py> <output_score.json>
 Bypasses the rollout entirely and just scores a `linear_ce.py`
 defining `FusedLinearCrossEntropy`. Used by `scripts/test_scoring.py`
 and `scripts/test_reward_hacks.py`.
-
-## AI usage statement
-
-This submission was developed with assistance from Claude Code,
-primarily for code-level support: debugging numerical and runtime
-issues, recalling Triton/PyTorch API details, writing test and
-benchmark boilerplate, and a few unfamiliar standard-library APIs
-(e.g. Python's `ast` module). All task-design decisions, including
-the choice of Cut Cross Entropy as the target, the multi-dimensional
-scoring composition, the reward-hacking attack vectors, and the
-calibration adjustments, were author-driven. Claude served as a
-sounding board and code assistant rather than a designer.

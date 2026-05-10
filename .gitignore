@@ -4,7 +4,7 @@ out
 scripts/sync_*.sh
 
 # Archived dev-iteration transcripts (kept locally for reference,
-# not part of the deliverable submission)
+# not committed)
 out_archive/
 
 # Ad-hoc transcript-debugging utilities, hardcoded to specific runs
